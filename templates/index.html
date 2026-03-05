@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SSL 管理面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <div class="container">
+      <div class="page-header">
+        <div class="title-group">
+          <h1>SSL 管理面板</h1>
+          <div class="subtitle">证书统一管理与自动续签</div>
+        </div>
+        <div class="toolbar">
+          <a class="button primary" href="{{ url_for('new_cert') }}">新增证书配置</a>
+        </div>
+      </div>
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <div class="flash">
+            {% for message in messages %}
+              <div class="flash-item">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">证书列表</div>
+          <div class="card-subtitle">统一管理与快速操作</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>域名</th>
+                <th>Webroot</th>
+                <th>到期时间</th>
+                <th>剩余天数</th>
+                <th>宝塔站点</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for cert in certs %}
+                <tr>
+                  <td class="text-strong">{{ cert.name }}</td>
+                  <td>{{ cert.domains }}</td>
+                  <td class="text-muted">{{ cert.webroot }}</td>
+                  <td>{{ cert.expiry or "未签发" }}</td>
+                  <td>{{ cert.days_left if cert.days_left is not none else "-" }}</td>
+                  <td>{{ cert.bt_site or cert.bt_cert_dir or "-" }}</td>
+                  <td class="row-actions">
+                    <form method="post" action="{{ url_for('issue', cert_id=cert.id) }}">
+                      <button type="submit">申请</button>
+                    </form>
+                    <form method="post" action="{{ url_for('renew', cert_id=cert.id) }}">
+                      <button type="submit" class="ghost">续签</button>
+                    </form>
+                    <form method="post" action="{{ url_for('delete_cert', cert_id=cert.id) }}">
+                      <button type="submit" class="danger">删除</button>
+                    </form>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

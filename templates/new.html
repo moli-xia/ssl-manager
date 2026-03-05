@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>新增证书配置</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <div class="container">
+      <div class="page-header">
+        <div class="title-group">
+          <h1>新增证书配置</h1>
+          <div class="subtitle">快速创建与统一管理</div>
+        </div>
+        <div class="toolbar">
+          <a class="button ghost" href="{{ url_for('index') }}">返回</a>
+        </div>
+      </div>
+      <div class="card form-card">
+        <form method="post">
+          <div class="form-row">
+            <label>名称</label>
+            <input type="text" name="name" required>
+          </div>
+          <div class="form-row">
+            <label>域名列表（逗号分隔）</label>
+            <input type="text" name="domains" required>
+          </div>
+          <div class="form-row">
+            <label>Webroot 路径</label>
+            <input type="text" name="webroot" required>
+          </div>
+          <div class="form-row">
+            <label>邮箱</label>
+            <input type="email" name="email" required>
+          </div>
+          <div class="form-row">
+            <label>宝塔站点名称（可选）</label>
+            <input type="text" name="bt_site">
+          </div>
+          <div class="form-row">
+            <label>宝塔证书目录（可选）</label>
+            <input type="text" name="bt_cert_dir" placeholder="/www/server/panel/vhost/cert/站点目录">
+          </div>
+          <div class="form-row">
+            <label>acme.sh 目录</label>
+            <input type="text" name="acme_home" value="{{ default_acme_home }}">
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="button primary">保存</button>
+            <a class="button ghost" href="{{ url_for('index') }}">取消</a>
+          </div>
+        </form>
+      </div>
+    </div>
+  </body>
+</html>

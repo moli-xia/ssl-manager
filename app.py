@@ -1,0 +1,2111 @@
+import base64
+import hashlib
+import hmac
+import html
+import io
+import json
+import os
+import re
+import secrets
+import ssl
+import sqlite3
+import subprocess
+import threading
+import time
+import zipfile
+from datetime import datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    DATA_DIR = BASE_DIR
+DB_PATH = DATA_DIR / "ssl_manager.db"
+DEFAULT_ACME_HOME = Path(os.environ.get("ACME_HOME", str(Path.home() / ".acme.sh")))
+ACME_CHALLENGE_ROOT = DATA_DIR / "acme-webroot"
+NGINX_DEFAULT_CONF = Path(os.environ.get("NGINX_DEFAULT_CONF", "/www/server/panel/vhost/nginx/0.default.conf"))
+ACME_PROXY_PORT = (os.environ.get("ACME_PROXY_PORT") or os.environ.get("PORT") or "8080").strip()
+
+
+def load_app_secret():
+    env = (os.environ.get("APP_SECRET") or "").strip()
+    if env:
+        return env.encode()
+    secret_file = DATA_DIR / "app_secret"
+    if secret_file.exists():
+        try:
+            val = secret_file.read_text("utf-8", errors="ignore").strip()
+            if val:
+                return val.encode()
+        except Exception:
+            pass
+    val = secrets.token_urlsafe(48)
+    try:
+        secret_file.write_text(val, encoding="utf-8")
+    except Exception:
+        pass
+    return val.encode()
+
+
+APP_SECRET = load_app_secret()
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+DOMAIN_RE = re.compile(r"^(\*\.)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+SITE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+def build_nginx_default_conf_for_acme(proxy_port):
+    port = str(proxy_port or "").strip()
+    if not port.isdigit():
+        port = "8080"
+    return (
+        "server\n"
+        "{\n"
+        "    listen 80;\n"
+        "    server_name _;\n"
+        "\n"
+        "    location ^~ /.well-known/acme-challenge/ {\n"
+        f"        proxy_pass http://127.0.0.1:{port};\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "    }\n"
+        "\n"
+        "    index index.html;\n"
+        "    root /www/server/nginx/html;\n"
+        "}\n"
+    )
+
+
+def nginx_default_has_acme_proxy(text):
+    if not text:
+        return False
+    if "/.well-known/acme-challenge/" not in text:
+        return False
+    if "proxy_pass" not in text:
+        return False
+    return True
+
+
+def bt_try_reload_nginx(panel):
+    if not panel:
+        return False, "未配置宝塔面板 API"
+    actions = [
+        ("/system", "RestartWeb"),
+        ("/system", "ReloadWeb"),
+        ("/system", "RestartNginx"),
+        ("/system", "ReloadNginx"),
+        ("/system", "NginxReload"),
+        ("/config", "RestartWeb"),
+        ("/config", "ReloadWeb"),
+    ]
+    for path, action in actions:
+        ok, status, body, _attempted, _meta = panel_api_request(panel, path, {"action": action})
+        if not ok:
+            continue
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data.get("status") is True:
+            return True, action
+        if status == 200 and ("success" in (body or "").lower() or "ok" in (body or "").lower()):
+            return True, action
+    return False, "宝塔未提供可用的重载接口（请手动重载 Nginx）"
+
+
+def apply_nginx_default_acme_proxy():
+    conf_path = NGINX_DEFAULT_CONF
+    try:
+        if not conf_path.exists():
+            return False, f"未找到默认站点文件：{conf_path}"
+        if not os.access(str(conf_path), os.R_OK | os.W_OK):
+            return False, f"无权限写入：{conf_path}（如使用 Docker，请将 /www/server/panel/vhost/nginx 以 rw 挂载进容器）"
+        old = conf_path.read_text("utf-8", errors="ignore")
+        new = build_nginx_default_conf_for_acme(ACME_PROXY_PORT)
+        if old.strip() == new.strip():
+            ok_reload, msg_reload = bt_try_reload_nginx(get_local_panel_config())
+            return (True, "配置已存在，已触发重载" if ok_reload else "配置已存在（请手动重载 Nginx）")
+        backup_dir = DATA_DIR / "nginx-default-backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        (backup_dir / f"0.default.conf.{stamp}.bak").write_text(old, encoding="utf-8")
+        conf_path.write_text(new, encoding="utf-8")
+        ok_reload, msg_reload = bt_try_reload_nginx(get_local_panel_config())
+        if ok_reload:
+            return True, "已写入并触发重载"
+        return True, "已写入（请手动重载 Nginx）"
+    except Exception as e:
+        return False, str(e)
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                must_change INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS panels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                admin_path TEXT NOT NULL,
+                api_token TEXT NOT NULL,
+                verify_ssl INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS certs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                domains TEXT NOT NULL,
+                webroot TEXT NOT NULL,
+                email TEXT NOT NULL,
+                panel_id INTEGER,
+                site_name TEXT,
+                acme_home TEXT NOT NULL,
+                cert_path TEXT,
+                key_path TEXT,
+                last_issued_at TEXT,
+                last_renew_at TEXT,
+                last_error TEXT,
+                last_notify_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                target TEXT,
+                status TEXT NOT NULL,
+                message TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur = conn.execute("SELECT COUNT(*) AS c FROM users")
+        if cur.fetchone()["c"] == 0:
+            now = datetime.utcnow().isoformat()
+            conn.execute(
+                "INSERT INTO users (username, password_hash, must_change, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                ("admin", create_password_hash("admin"), 1, now, now),
+            )
+        ensure_panel_schema(conn)
+    bootstrap_local_panel()
+
+
+def bootstrap_local_panel():
+    try:
+        with get_db() as conn:
+            cur = conn.execute("SELECT COUNT(*) AS c FROM panels")
+            if cur.fetchone()["c"] != 0:
+                return
+    except Exception:
+        return
+
+    api_path = Path("/www/server/panel/config/api.json")
+    admin_path_file = Path("/www/server/panel/data/admin_path.pl")
+    if not api_path.exists() or not admin_path_file.exists():
+        return
+
+    try:
+        api = json.loads(api_path.read_text("utf-8", errors="ignore") or "{}")
+    except Exception:
+        return
+
+    token_crypt = (api.get("token_crypt") or "").strip()
+    if not token_crypt:
+        return
+
+    admin_path = admin_path_file.read_text("utf-8", errors="ignore").strip() or "/bt"
+
+    base_ip = ""
+    for ip in api.get("limit_addr") or []:
+        ip = str(ip).strip()
+        if not ip:
+            continue
+        if ip.startswith("127.") or ip == "::1":
+            continue
+        if ip.startswith("10.") or ip.startswith("192.168."):
+            continue
+        if ip.startswith("172.") and re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", ip):
+            continue
+        base_ip = ip
+        break
+
+    base_url = f"https://{base_ip}:22460" if base_ip else "https://127.0.0.1:22460"
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO panels (name, base_url, admin_path, api_token, verify_ssl, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("本机面板", base_url, admin_path, token_crypt, 0, now, now),
+        )
+
+
+def ensure_panel_schema(conn):
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(panels)").fetchall()]
+    if "verify_ssl" not in cols:
+        conn.execute("ALTER TABLE panels ADD COLUMN verify_ssl INTEGER NOT NULL DEFAULT 0")
+
+
+def create_password_hash(password):
+    salt = secrets.token_bytes(16)
+    iterations = 200000
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return "pbkdf2_sha256$%d$%s$%s" % (
+        iterations,
+        base64.b64encode(salt).decode(),
+        base64.b64encode(dk).decode(),
+    )
+
+
+def verify_password(password, password_hash):
+    try:
+        _, iter_s, salt_b64, dk_b64 = password_hash.split("$")
+        iterations = int(iter_s)
+        salt = base64.b64decode(salt_b64)
+        dk = base64.b64decode(dk_b64)
+        cand = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+        return hmac.compare_digest(dk, cand)
+    except Exception:
+        return False
+
+
+def sign_session(user_id, must_change, ttl=86400):
+    payload = f"{user_id}.{must_change}.{int(time.time()) + ttl}"
+    sig = hmac.new(APP_SECRET, payload.encode(), hashlib.sha256).digest()
+    return base64.b64encode(payload.encode() + b"." + sig).decode()
+
+
+def verify_session(token):
+    try:
+        raw = base64.b64decode(token.encode())
+        payload, sig = raw.rsplit(b".", 1)
+        if not hmac.compare_digest(sig, hmac.new(APP_SECRET, payload, hashlib.sha256).digest()):
+            return None
+        user_id_s, must_change_s, exp_s = payload.decode().split(".")
+        if int(exp_s) < int(time.time()):
+            return None
+        return int(user_id_s), int(must_change_s)
+    except Exception:
+        return None
+
+
+def get_current_user(handler):
+    cookie = handler.headers.get("Cookie", "")
+    token = None
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith("session="):
+            token = part.split("=", 1)[1]
+            break
+    if not token:
+        return None
+    info = verify_session(token)
+    if not info:
+        return None
+    user_id, _ = info
+    with get_db() as conn:
+        user = conn.execute("SELECT id, username, must_change FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        return None
+    return dict(user)
+
+
+def get_setting(key, default=""):
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def get_local_bt_settings():
+    base_url = (os.environ.get("BT_BASE_URL") or get_setting("bt_base_url") or "").strip()
+    admin_path = (os.environ.get("BT_ADMIN_PATH") or get_setting("bt_admin_path") or "").strip()
+    api_token = (os.environ.get("BT_API_TOKEN") or get_setting("bt_api_token") or "").strip()
+    verify_ssl = (os.environ.get("BT_VERIFY_SSL") or get_setting("bt_verify_ssl") or "0").strip()
+    try:
+        verify_ssl_i = 1 if int(verify_ssl) else 0
+    except Exception:
+        verify_ssl_i = 0
+    return {"base_url": base_url, "admin_path": admin_path, "api_token": api_token, "verify_ssl": verify_ssl_i}
+
+
+def save_local_bt_settings(base_url, admin_path, api_token, verify_ssl):
+    set_setting("bt_base_url", (base_url or "").strip())
+    set_setting("bt_admin_path", (admin_path or "").strip())
+    set_setting("bt_api_token", (api_token or "").strip())
+    set_setting("bt_verify_ssl", "1" if verify_ssl else "0")
+
+
+def log_action(action, target, status, message=""):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO logs (action, target, status, message, created_at) VALUES (?, ?, ?, ?, ?)",
+            (action, target, status, message, datetime.utcnow().isoformat()),
+        )
+
+
+def run_command(args, use_shell=False):
+    try:
+        result = subprocess.run(
+            args,
+            shell=use_shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        return result.returncode == 0, result.stdout.strip()
+    except FileNotFoundError as e:
+        return False, f"命令不存在: {e.filename}"
+
+
+def ensure_acme_sh(acme_home, email):
+    acme_sh = Path(acme_home) / "acme.sh"
+    account_conf = Path(acme_home) / "account.conf"
+    if acme_sh.exists():
+        if account_conf.exists() and email:
+            try:
+                text = account_conf.read_text("utf-8", errors="ignore")
+                m = re.search(r"^ACCOUNT_EMAIL='([^']*)'$", text, flags=re.M)
+                if m and m.group(1).endswith("@example.com"):
+                    text = re.sub(
+                        r"^ACCOUNT_EMAIL='[^']*'$",
+                        f"ACCOUNT_EMAIL='{email}'",
+                        text,
+                        flags=re.M,
+                    )
+                    account_conf.write_text(text)
+            except Exception:
+                pass
+        ok, output = run_command(
+            [
+                "bash",
+                "-lc",
+                f"{acme_sh} --home {acme_home} --config-home {acme_home} --set-default-ca --server letsencrypt",
+            ]
+        )
+        if not ok:
+            return False, str(acme_sh), output
+        ok, output = run_command(
+            [
+                "bash",
+                "-lc",
+                f"{acme_sh} --home {acme_home} --config-home {acme_home} --register-account --server letsencrypt",
+            ]
+        )
+        if not ok:
+            return False, str(acme_sh), output
+        ok, output = run_command(
+            [
+                "bash",
+                "-lc",
+                f"{acme_sh} --home {acme_home} --config-home {acme_home} --update-account -m {email} --server letsencrypt",
+            ]
+        )
+        if not ok:
+            return False, str(acme_sh), output
+        return True, str(acme_sh), ""
+    if not EMAIL_RE.match(email):
+        return False, str(acme_sh), "邮箱格式不正确"
+    Path(acme_home).mkdir(parents=True, exist_ok=True)
+    cmd = f"set -o pipefail; curl -fsSL https://get.acme.sh | sh -s email={email} --force"
+    ok, output = run_command(["bash", "-lc", cmd])
+    if not ok or not acme_sh.exists():
+        return False, str(acme_sh), output or "acme.sh 安装失败"
+    if account_conf.exists() and email:
+        try:
+            text = account_conf.read_text("utf-8", errors="ignore")
+            m = re.search(r"^ACCOUNT_EMAIL='([^']*)'$", text, flags=re.M)
+            if m and m.group(1).endswith("@example.com"):
+                text = re.sub(
+                    r"^ACCOUNT_EMAIL='[^']*'$",
+                    f"ACCOUNT_EMAIL='{email}'",
+                    text,
+                    flags=re.M,
+                )
+                account_conf.write_text(text)
+        except Exception:
+            pass
+    ok, output2 = run_command(
+        [
+            "bash",
+            "-lc",
+            f"{acme_sh} --home {acme_home} --config-home {acme_home} --set-default-ca --server letsencrypt",
+        ]
+    )
+    if not ok:
+        return False, str(acme_sh), output2
+    ok, output3 = run_command(
+        [
+            "bash",
+            "-lc",
+            f"{acme_sh} --home {acme_home} --config-home {acme_home} --register-account --server letsencrypt",
+        ]
+    )
+    if not ok:
+        return False, str(acme_sh), output3
+    ok, output4 = run_command(
+        [
+            "bash",
+            "-lc",
+            f"{acme_sh} --home {acme_home} --config-home {acme_home} --update-account -m {email} --server letsencrypt",
+        ]
+    )
+    if not ok:
+        return False, str(acme_sh), output4
+    return True, str(acme_sh), output
+
+
+def primary_domain(domains):
+    return domains.split(",")[0].strip()
+
+
+def cert_file_paths(acme_home, domains):
+    domain = primary_domain(domains)
+    ecc_dir = Path(acme_home) / f"{domain}_ecc"
+    if (ecc_dir / "fullchain.cer").exists() and (ecc_dir / f"{domain}.key").exists():
+        return str(ecc_dir / "fullchain.cer"), str(ecc_dir / f"{domain}.key")
+    domain_dir = Path(acme_home) / domain
+    return str(domain_dir / "fullchain.cer"), str(domain_dir / f"{domain}.key")
+
+
+def find_existing_cert_files(acme_home, domains):
+    cert_path, key_path = cert_file_paths(acme_home, domains)
+    if Path(cert_path).exists() and Path(key_path).exists():
+        return cert_path, key_path
+    domain = primary_domain(domains)
+    bt_dir = Path("/www/server/panel/vhost/cert") / domain
+    bt_cert = bt_dir / "fullchain.pem"
+    bt_key = bt_dir / "privkey.pem"
+    if bt_cert.exists() and bt_key.exists():
+        return str(bt_cert), str(bt_key)
+    return None
+
+
+def parse_expiry(cert_path):
+    if not cert_path or not Path(cert_path).exists():
+        return None
+    ok, output = run_command(["openssl", "x509", "-enddate", "-noout", "-in", cert_path])
+    if not ok or "notAfter=" not in output:
+        return None
+    date_str = output.split("notAfter=")[-1].strip()
+    try:
+        return datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z")
+    except ValueError:
+        return None
+
+
+def validate_domains(domains):
+    items = [d.strip() for d in domains.split(",") if d.strip()]
+    if not items:
+        return False, "域名不能为空"
+    invalid = [d for d in items if not DOMAIN_RE.match(d)]
+    if invalid:
+        return False, f"域名格式不正确: {', '.join(invalid)}"
+    return True, items
+
+
+def probe_http01_webroot(domain, webroot):
+    d = (domain or "").strip()
+    w = (webroot or "").strip()
+    if not d or not w:
+        return False, "参数错误"
+    token = secrets.token_urlsafe(18)
+    challenge_dir = Path(w) / ".well-known" / "acme-challenge"
+    file_path = challenge_dir / token
+    try:
+        challenge_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(Path(w)), 0o755)
+        except Exception:
+            pass
+        try:
+            os.chmod(str(Path(w) / ".well-known"), 0o755)
+        except Exception:
+            pass
+        try:
+            os.chmod(str(challenge_dir), 0o755)
+        except Exception:
+            pass
+        file_path.write_text(token, encoding="utf-8")
+        try:
+            os.chmod(str(file_path), 0o644)
+        except Exception:
+            pass
+
+        url = f"http://{d}/.well-known/acme-challenge/{token}"
+        req = Request(url, method="GET")
+        with urlopen(req, timeout=12) as resp:
+            body = resp.read(2048).decode("utf-8", errors="ignore").strip()
+            if resp.status == 200 and token in body:
+                return True, ""
+            return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def domains_overlap(a, b):
+    set_a = {x.strip().lower() for x in (a or "").split(",") if x.strip()}
+    set_b = {x.strip().lower() for x in (b or "").split(",") if x.strip()}
+    return bool(set_a & set_b)
+
+
+def has_cert_config_for_domains(domains):
+    if not domains:
+        return False
+    with get_db() as conn:
+        rows = conn.execute("SELECT domains FROM certs").fetchall()
+    for r in rows:
+        if domains_overlap(domains, r["domains"]):
+            return True
+    return False
+
+
+def get_existing_cert_id_for_domains(domains):
+    if not domains:
+        return None
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, domains FROM certs ORDER BY id DESC").fetchall()
+    for r in rows:
+        if domains_overlap(domains, r["domains"]):
+            return r["id"]
+    return None
+
+
+def is_error_message(message):
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    keywords = [
+        "失败",
+        "错误",
+        "无效",
+        "不存在",
+        "参数错误",
+        "无法",
+        "拒绝",
+        "已存在",
+        "禁止",
+        "exception",
+        "traceback",
+        "error",
+    ]
+    low = msg.lower()
+    for k in keywords:
+        if k in msg or k in low:
+            return True
+    return False
+
+
+def issue_cert(cert):
+    acme_home = cert["acme_home"]
+    ok, acme_sh, output = ensure_acme_sh(acme_home, cert["email"])
+    if not ok:
+        log_action("issue", cert["domains"], "fail", output or "acme.sh 安装失败")
+        return False, output or "acme.sh 安装失败"
+    existing = find_existing_cert_files(acme_home, cert["domains"])
+    if existing:
+        log_action("issue", cert["domains"], "ok", "already issued")
+        return True, existing
+    valid, result = validate_domains(cert["domains"])
+    if not valid:
+        log_action("issue", cert["domains"], "fail", result)
+        return False, result
+    domain_args = []
+    for d in result:
+        domain_args.extend(["-d", d])
+
+    webroot = (cert["webroot"] or "").strip()
+    fallback = str(ACME_CHALLENGE_ROOT)
+    try:
+        site_name = (cert["site_name"] or "").strip()
+    except Exception:
+        site_name = ""
+    if site_name:
+        if (not webroot) or (webroot == fallback) or (webroot and Path(webroot).name == "acme-webroot"):
+            guessed = guess_webroot_for_domain(primary_domain(cert["domains"]), site_name)
+            if guessed and guessed != webroot:
+                webroot = guessed
+                try:
+                    with get_db() as conn:
+                        conn.execute(
+                            "UPDATE certs SET webroot = ?, updated_at = ? WHERE id = ?",
+                            (webroot, datetime.utcnow().isoformat(), cert["id"]),
+                        )
+                except Exception:
+                    pass
+        if webroot and (not Path(webroot).exists()):
+            guessed = guess_webroot_for_domain(primary_domain(cert["domains"]), site_name)
+            if guessed and guessed != webroot and Path(guessed).exists():
+                webroot = guessed
+                try:
+                    with get_db() as conn:
+                        conn.execute(
+                            "UPDATE certs SET webroot = ?, updated_at = ? WHERE id = ?",
+                            (webroot, datetime.utcnow().isoformat(), cert["id"]),
+                        )
+                except Exception:
+                    pass
+    if not webroot:
+        log_action("issue", cert["domains"], "fail", "未找到可用的 Webroot")
+        return False, "未找到可用的 Webroot（请确保 80 端口能访问到本面板的 ACME 挑战路径）"
+    if not Path(webroot).exists():
+        log_action("issue", cert["domains"], "fail", f"Webroot 不存在: {webroot}")
+        return False, f"Webroot 不存在：{webroot}"
+    for d in result:
+        ok_probe, msg_probe = probe_http01_webroot(d, webroot)
+        if not ok_probe:
+            detail = f"域名 {d} 无法通过 HTTP 访问到当前 Webroot 的挑战文件：{msg_probe}"
+            hint = f"当前 Webroot: {webroot}。请确保 Nginx 已将 /.well-known/acme-challenge/ 转发到本面板（例如 proxy_pass http://127.0.0.1:8088）。"
+            log_action("issue", cert["domains"], "fail", f"{detail}; {hint}")
+            return False, f"{detail}。{hint}"
+    cmd = [
+        acme_sh,
+        "--home",
+        acme_home,
+        "--config-home",
+        acme_home,
+        "--server",
+        "letsencrypt",
+        "--issue",
+        "--webroot",
+        webroot,
+    ]
+    cmd.extend(domain_args)
+    ok, output = run_command(cmd)
+    if not ok:
+        cert_path, key_path = cert_file_paths(acme_home, cert["domains"])
+        if (
+            Path(cert_path).exists()
+            and Path(key_path).exists()
+            and ("Skipping. Next renewal time is" in output or "Domains not changed." in output)
+        ):
+            log_action("issue", cert["domains"], "ok", "already issued")
+            return True, (cert_path, key_path)
+        log_action("issue", cert["domains"], "fail", output)
+        return False, output
+    cert_path, key_path = cert_file_paths(acme_home, cert["domains"])
+    log_action("issue", cert["domains"], "ok", "issued")
+    return True, (cert_path, key_path)
+
+
+def renew_cert(cert):
+    acme_home = cert["acme_home"]
+    acme_sh = Path(acme_home) / "acme.sh"
+    if not acme_sh.exists():
+        log_action("renew", cert["domains"], "fail", "acme.sh 未安装")
+        return False, "acme.sh 未安装"
+    domain = primary_domain(cert["domains"])
+    cmd = [str(acme_sh), "--home", acme_home, "--config-home", acme_home, "--renew", "-d", domain]
+    ok, output = run_command(cmd)
+    if not ok:
+        log_action("renew", cert["domains"], "fail", output)
+        return False, output
+    cert_path, key_path = cert_file_paths(acme_home, cert["domains"])
+    log_action("renew", cert["domains"], "ok", "renewed")
+    return True, (cert_path, key_path)
+
+
+def record_error(cert_id, error):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE certs SET last_error = ?, updated_at = ? WHERE id = ?",
+            (error, datetime.utcnow().isoformat(), cert_id),
+        )
+
+
+def record_issue(cert_id, cert_path, key_path):
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE certs
+            SET cert_path = ?, key_path = ?, last_issued_at = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (cert_path, key_path, datetime.utcnow().isoformat(), None, datetime.utcnow().isoformat(), cert_id),
+        )
+
+
+def record_renew(cert_id, cert_path, key_path):
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE certs
+            SET cert_path = ?, key_path = ?, last_renew_at = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (cert_path, key_path, datetime.utcnow().isoformat(), None, datetime.utcnow().isoformat(), cert_id),
+        )
+
+
+def record_notify(cert_id):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE certs SET last_notify_at = ?, updated_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), cert_id),
+        )
+
+
+def get_certs():
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT c.*, p.name AS panel_name
+            FROM certs c
+            LEFT JOIN panels p ON c.panel_id = p.id
+            ORDER BY c.id DESC
+            """
+        ).fetchall()
+
+
+def get_panels():
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM panels ORDER BY id DESC").fetchall()
+
+
+def api_sign(token):
+    request_time = str(int(time.time()))
+    secret = (token or "").strip()
+    if not re.fullmatch(r"[a-fA-F0-9]{32}", secret):
+        secret = hashlib.md5(secret.encode()).hexdigest()
+    request_token = hashlib.md5((request_time + secret).encode()).hexdigest()
+    return request_time, request_token
+
+
+def ssl_context_for_url(url, verify_ssl):
+    if verify_ssl:
+        return None
+    if not url.lower().startswith("https://"):
+        return None
+    return ssl._create_unverified_context()
+
+
+def http_post_form(url, data, timeout=15, verify_ssl=True):
+    body = urlencode(data).encode()
+    req = Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        ctx = ssl_context_for_url(url, verify_ssl)
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            return True, resp.status, resp.read().decode()
+    except HTTPError as e:
+        try:
+            return False, e.code, e.read().decode()
+        except Exception:
+            return False, e.code, ""
+    except URLError as e:
+        return False, 0, str(e)
+
+
+def http_get(url, timeout=15, verify_ssl=True):
+    req = Request(url, method="GET")
+    try:
+        ctx = ssl_context_for_url(url, verify_ssl)
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            return True, resp.status, resp.read().decode()
+    except HTTPError as e:
+        try:
+            return False, e.code, e.read().decode()
+        except Exception:
+            return False, e.code, ""
+    except URLError as e:
+        return False, 0, str(e)
+
+
+def normalize_admin_path(admin_path):
+    if not admin_path:
+        return "/bt"
+    if not admin_path.startswith("/"):
+        admin_path = "/" + admin_path
+    return admin_path.rstrip("/")
+
+
+def row_value(row, key, default=None):
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+def strip_admin_path(base_url, admin_path):
+    parsed = urlparse(base_url)
+    path = parsed.path.rstrip("/")
+    admin_path = normalize_admin_path(admin_path)
+    if path.endswith(admin_path):
+        path = path[: -len(admin_path)]
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+def panel_base_roots(panel):
+    base_url = panel["base_url"].strip().rstrip("/")
+    admin_path = normalize_admin_path(panel["admin_path"])
+    parsed = urlparse(base_url)
+    origin = urlunparse((parsed.scheme, parsed.netloc, "", "", "", "")).rstrip("/")
+    cleaned = strip_admin_path(base_url, admin_path).rstrip("/")
+    roots = []
+
+    if origin:
+        roots.append(f"{origin}{admin_path}")
+        roots.append(origin)
+        roots.append(f"{origin}/bt")
+    if cleaned:
+        roots.append(f"{cleaned}{admin_path}")
+        roots.append(cleaned)
+        roots.append(f"{cleaned}/bt")
+    if base_url:
+        roots.append(base_url if base_url.endswith(admin_path) else f"{base_url}{admin_path}")
+        roots.append(base_url)
+
+    seen = []
+    for r in roots:
+        if not r:
+            continue
+        if r.endswith("/"):
+            r = r.rstrip("/")
+        if r not in seen:
+            seen.append(r)
+    return seen
+
+
+def looks_like_html(body):
+    if not body:
+        return False
+    head = body.lstrip()[:300].lower()
+    return "<html" in head or "<!doctype html" in head or "safety entrance error" in head
+
+
+def panel_api_request(panel, path, params):
+    request_time, request_token = api_sign(panel["api_token"])
+    payload = dict(params)
+    payload["request_time"] = request_time
+    payload["request_token"] = request_token
+    meta = {"request_time": request_time, "request_token": request_token}
+    verify_ssl = bool(int(row_value(panel, "verify_ssl", 0) or 0))
+    last = (False, 0, "")
+    attempted = []
+    for root in panel_base_roots(panel):
+        base = f"{root}{path}"
+        attempted.append(base)
+        ok, status, body = http_post_form(base, payload, verify_ssl=verify_ssl)
+        if status == 404:
+            ok2, status2, body2 = http_get(f"{base}?{urlencode(payload)}", verify_ssl=verify_ssl)
+            if status2 != 404:
+                ok, status, body = ok2, status2, body2
+            else:
+                last = (ok, status, body)
+                continue
+        if looks_like_html(body):
+            last = (ok, status, body)
+            continue
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict) and data.get("status") is False:
+                msg = str(data.get("msg", ""))
+                if msg in {"Secret key verification failed", "Key verification failed"}:
+                    last = (ok, status, body)
+                    continue
+        except Exception:
+            pass
+        return ok, status, body, attempted, meta
+    return last[0], last[1], last[2], attempted, meta
+
+
+def test_panel(panel):
+    ok, status, body, attempted, meta = panel_api_request(panel, "/system", {"action": "GetSystemTotal"})
+    attempted_msg = f" 已尝试: {' | '.join(attempted)}" if attempted else ""
+    if status == 404:
+        return False, f"HTTP 404，请检查访问地址或Admin Path 是否重复.{attempted_msg}"
+    if not ok and status == 0:
+        if "CERTIFICATE_VERIFY_FAILED" in (body or ""):
+            return (
+                False,
+                "HTTPS 证书校验失败：远程宝塔面板可能使用自签证书或证书链不完整。"
+                "请到“宝塔面板管理”里编辑该面板，关闭“验证 HTTPS 证书”，或为面板换成有效证书。"
+                + attempted_msg,
+            )
+        return False, (body or "无法连接") + attempted_msg
+    if "Safety entrance error" in body or "安全入口" in body:
+        return False, f"安全入口错误：请把宝塔“安全入口”填到 Admin Path（如 /24315b07），并确保面板地址不重复包含该路径.{attempted_msg}"
+    try:
+        data = json.loads(body)
+    except Exception:
+        return False, f"响应解析失败: HTTP {status}.{attempted_msg}"
+    if data.get("status") is False:
+        msg = data.get("msg", "连接失败")
+        if msg == "Secret key verification failed":
+            sig = (meta.get("request_token") or "")[:8]
+            rt = meta.get("request_time") or ""
+            msg = f"Secret key verification failed（签名不匹配）。本次签名: request_time={rt}, request_token={sig}****；宝塔校验规则为 md5(request_time + 接口密钥)"
+        elif msg == "Key verification failed":
+            msg = "Key verification failed（宝塔未设置/未保存接口密钥：请在宝塔面板-设置-API接口生成并保存接口密钥）"
+        return False, f"{msg}{attempted_msg}"
+    return True, "连接成功"
+
+
+def get_local_panel_config():
+    stored = get_local_bt_settings()
+    if stored.get("api_token"):
+        base_url = stored.get("base_url") or "https://127.0.0.1:22460"
+        admin_path = stored.get("admin_path") or "/bt"
+        return {
+            "name": "本机面板",
+            "base_url": base_url,
+            "admin_path": admin_path,
+            "api_token": stored.get("api_token"),
+            "verify_ssl": stored.get("verify_ssl", 0),
+        }
+
+    api_path = Path("/www/server/panel/config/api.json")
+    admin_path_file = Path("/www/server/panel/data/admin_path.pl")
+    if not api_path.exists() or not admin_path_file.exists():
+        return None
+    try:
+        api = json.loads(api_path.read_text("utf-8", errors="ignore") or "{}")
+    except Exception:
+        return None
+    token_crypt = (api.get("token_crypt") or "").strip()
+    if not token_crypt:
+        return None
+    admin_path = admin_path_file.read_text("utf-8", errors="ignore").strip() or "/bt"
+    base_ip = ""
+    for ip in api.get("limit_addr") or []:
+        ip = str(ip).strip()
+        if not ip:
+            continue
+        if ip.startswith("127.") or ip == "::1":
+            continue
+        if ip.startswith("10.") or ip.startswith("192.168."):
+            continue
+        if ip.startswith("172.") and re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", ip):
+            continue
+        base_ip = ip
+        break
+    base_url = f"https://{base_ip}:22460" if base_ip else "https://127.0.0.1:22460"
+    return {"name": "本机面板", "base_url": base_url, "admin_path": admin_path, "api_token": token_crypt, "verify_ssl": 0}
+
+
+def deploy_local(site_name, cert_path, key_path):
+    if not site_name:
+        return True, "未配置本机站点，跳过部署"
+    local_panel = get_local_panel_config()
+    if local_panel:
+        return deploy_remote(local_panel, site_name, cert_path, key_path)
+    cert_source = Path(cert_path)
+    key_source = Path(key_path)
+    if not cert_source.exists() or not key_source.exists():
+        return False, "证书文件不存在"
+    target_dir = Path(f"/www/server/panel/vhost/cert/{site_name}")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / "fullchain.pem").write_bytes(cert_source.read_bytes())
+    (target_dir / "privkey.pem").write_bytes(key_source.read_bytes())
+    ok, output = run_command(["nginx", "-s", "reload"])
+    if not ok:
+        ok, output = run_command(["systemctl", "reload", "nginx"])
+    return ok, output
+
+
+def deploy_remote(panel, site_name, cert_path, key_path):
+    if not site_name:
+        return False, "远程站点名称为空"
+    cert_source = Path(cert_path)
+    key_source = Path(key_path)
+    if not cert_source.exists() or not key_source.exists():
+        return False, "证书文件不存在"
+    csr = cert_source.read_text()
+    key = key_source.read_text()
+    ok, status, resp, _attempted, _meta = panel_api_request(
+        panel,
+        "/site",
+        {"action": "SetSSL", "siteName": site_name, "key": key, "csr": csr},
+    )
+    return ok, resp or f"HTTP {status}"
+
+
+def auto_loop():
+    time.sleep(120)
+    while True:
+        certs = get_certs()
+        for cert in certs:
+            expiry = parse_expiry(cert["cert_path"])
+            if not expiry:
+                continue
+            days_left = (expiry - datetime.utcnow()).days
+            if days_left <= 30:
+                ok, result = renew_cert(cert)
+                if not ok:
+                    record_error(cert["id"], result)
+                    continue
+                cert_path, key_path = result
+                record_renew(cert["id"], cert_path, key_path)
+                deploy_local(cert["site_name"], cert_path, key_path)
+        time.sleep(24 * 3600)
+
+
+def read_body(handler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length <= 0:
+        return ""
+    return handler.rfile.read(length).decode("utf-8")
+
+
+def parse_form(handler):
+    data = read_body(handler)
+    return parse_qs(data)
+
+
+def json_response(handler, payload, status=HTTPStatus.OK):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def render_page(content, message=""):
+    show_error_modal = is_error_message(message)
+    return f"""
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8">
+    <title>SSL 管理面板</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <div class="container">
+      <header class="app-header">
+        <div class="app-brand">
+          <div class="app-title">SSL 管理面板</div>
+          <div class="app-subtitle">证书统一管理 · 自动续签 · 一键部署</div>
+        </div>
+      </header>
+      {"" if show_error_modal or not message else f'<div class="flash">{html.escape(message)}</div>'}
+      {f'''
+      <div class="modal-mask" id="modal-mask" aria-hidden="true">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+          <div class="modal-header">
+            <div class="modal-title" id="modal-title">操作失败</div>
+            <button class="modal-close" type="button" onclick="window.__closeModal && window.__closeModal()">×</button>
+          </div>
+          <div class="modal-body"><pre class="modal-pre">{html.escape(message)}</pre></div>
+          <div class="modal-footer">
+            <button class="button primary" type="button" onclick="window.__closeModal && window.__closeModal()">我知道了</button>
+          </div>
+        </div>
+      </div>
+      <script>
+        (function () {{
+          function closeModal() {{
+            var m = document.getElementById('modal-mask');
+            if (m) {{
+              m.classList.remove('show');
+              m.setAttribute('aria-hidden', 'true');
+            }}
+          }}
+          window.__closeModal = closeModal;
+          var mask = document.getElementById('modal-mask');
+          if (mask) {{
+            mask.addEventListener('click', function (e) {{
+              if (e.target === mask) closeModal();
+            }});
+            document.addEventListener('keydown', function (e) {{
+              if (e.key === 'Escape') closeModal();
+            }});
+          }}
+          {('var m = document.getElementById("modal-mask"); if (m) { m.classList.add("show"); m.setAttribute("aria-hidden", "false"); }' if show_error_modal else '')}
+        }})();
+      </script>
+      ''' if show_error_modal else ""}
+      {content}
+    </div>
+  </body>
+</html>
+"""
+
+
+def render_login(message=""):
+    content = f"""
+    <form method="post">
+      <div class="form-row"><label>用户名</label><input type="text" name="username" required></div>
+      <div class="form-row"><label>密码</label><input type="password" name="password" required></div>
+      <div class="actions"><button type="submit">登录</button></div>
+    </form>
+    """
+    return render_page(content, message)
+
+
+def render_password(message=""):
+    content = f"""
+    <form method="post">
+      <div class="form-row"><label>旧密码</label><input type="password" name="old_password" required></div>
+      <div class="form-row"><label>新密码</label><input type="password" name="new_password" required></div>
+      <div class="form-row"><label>确认新密码</label><input type="password" name="confirm_password" required></div>
+      <div class="actions"><button type="submit">修改密码</button></div>
+    </form>
+    """
+    return render_page(content, message)
+
+
+def render_index(message=""):
+    rows = []
+    for cert in get_certs():
+        expiry = parse_expiry(cert["cert_path"])
+        days_left = (expiry - datetime.utcnow()).days if expiry else None
+        panel_name = "本机"
+        status_badge = '<span class="badge success">自动续签中</span>' if expiry else '<span class="badge warning">未签发</span>'
+        needs_issue = not bool(expiry)
+        rows.append(
+            f"""
+            <tr>
+              <td>{html.escape(cert["name"])}</td>
+              <td>
+                <div class="domain-wrapper">
+                  <div class="domain-text">{html.escape(cert["domains"])}</div>
+                  {status_badge}
+                </div>
+              </td>
+              <td class="cell-mono">{html.escape(cert["webroot"])}</td>
+              <td>{html.escape(panel_name)}</td>
+              <td>{html.escape(cert["site_name"] or "-")}</td>
+              <td>{expiry or "未签发"}</td>
+              <td class="cell-number">{days_left if days_left is not None else "-"}</td>
+              <td>
+                <div class="btn-group">
+                  {f'<form method="post" action="/issue?id={cert["id"]}"><button type="submit" class="button primary small">申请</button></form>' if needs_issue else ''}
+                  <a class="button ghost small" href="/cert?id={cert['id']}">查看/下载</a>
+                  {'' if needs_issue else f'<form method="post" action="/renew?id={cert["id"]}"><button type="submit" class="button ghost small">续签</button></form>'}
+                  <form method="post" action="/delete?id={cert['id']}"><button class="button danger small" type="submit">删除</button></form>
+                </div>
+              </td>
+            </tr>
+            """
+        )
+    content = f"""
+    <div class="page-toolbar">
+      <div class="toolbar-left">
+        <a class="button primary" href="/new">申请免费证书</a>
+        <a class="button ghost" href="/import/local">导入本机站点</a>
+      </div>
+      <div class="toolbar-right">
+        <a class="button ghost" href="/bt">本机宝塔设置</a>
+        <a class="button ghost" href="/logs">操作日志</a>
+        <a class="button danger" href="/logout">退出登录</a>
+      </div>
+    </div>
+    <div class="card">
+    <div class="table-responsive">
+    <table class="cert-table">
+      <thead>
+        <tr>
+          <th>名称</th>
+          <th>域名</th>
+          <th>Webroot</th>
+          <th>面板</th>
+          <th>站点</th>
+          <th>到期时间</th>
+          <th>剩余天数</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    </div>
+    </div>
+    """
+    return render_page(content, message)
+
+
+def render_new(message=""):
+    content = f"""
+    <form method="post">
+      <h2>申请免费证书</h2>
+      <div class="form-row"><label>域名（逗号分隔）</label><input type="text" name="domains" placeholder="example.com, www.example.com" required></div>
+      <div class="flash">请确保域名已解析到本服务器，并且 80 端口可访问到本服务。</div>
+      <div class="actions"><button type="submit" class="button primary">立即申请</button><a class="button ghost" href="/">返回</a></div>
+    </form>
+    """
+    return render_page(content, message)
+
+
+def render_cert_detail(cert, message=""):
+    cert_id = cert["id"]
+    domains = cert["domains"] or ""
+    expiry = parse_expiry(cert["cert_path"]) if cert["cert_path"] else None
+    cert_path = cert["cert_path"] or ""
+    key_path = cert["key_path"] or ""
+    cert_text = ""
+    key_text = ""
+    if cert_path and Path(cert_path).exists():
+        try:
+            cert_text = Path(cert_path).read_text("utf-8", errors="ignore")
+        except Exception:
+            cert_text = ""
+    if key_path and Path(key_path).exists():
+        try:
+            key_text = Path(key_path).read_text("utf-8", errors="ignore")
+        except Exception:
+            key_text = ""
+    content = f"""
+    <div class="page-toolbar">
+      <div class="toolbar-left">
+        <a class="button ghost" href="/">返回</a>
+      </div>
+      <div class="toolbar-right">
+        <a class="button ghost" href="/download?type=zip&id={cert_id}">下载证书包</a>
+      </div>
+    </div>
+    <div class="card">
+      <h2>证书详情</h2>
+      <table>
+        <tbody>
+          <tr><th style="width:160px">域名</th><td>{html.escape(domains)}</td></tr>
+          <tr><th>到期时间</th><td>{html.escape(str(expiry) if expiry else "未签发")}</td></tr>
+          <tr><th>证书文件</th><td class="cell-mono">{html.escape(cert_path or "-")}</td></tr>
+          <tr><th>私钥文件</th><td class="cell-mono">{html.escape(key_path or "-")}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="page-toolbar">
+        <div class="toolbar-left"><h2 style="margin:0">证书内容（fullchain）</h2></div>
+        <div class="toolbar-right">
+          <button type="button" class="button ghost" onclick="window.__copyText('cert-text')">复制</button>
+          <a class="button ghost" href="/download?type=cert&id={cert_id}">下载</a>
+        </div>
+      </div>
+      <textarea class="code-text" id="cert-text" readonly>{html.escape(cert_text)}</textarea>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="page-toolbar">
+        <div class="toolbar-left"><h2 style="margin:0">私钥内容（key）</h2></div>
+        <div class="toolbar-right">
+          <button type="button" class="button ghost" onclick="window.__copyText('key-text')">复制</button>
+          <a class="button ghost" href="/download?type=key&id={cert_id}">下载</a>
+        </div>
+      </div>
+      <textarea class="code-text" id="key-text" readonly>{html.escape(key_text)}</textarea>
+    </div>
+    <script>
+      window.__copyText = function (id) {{
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.focus();
+        el.select();
+        try {{ document.execCommand('copy'); }} catch (e) {{}}
+      }};
+    </script>
+    """
+    return render_page(content, message)
+
+
+def render_panels(message=""):
+    rows = []
+    for p in get_panels():
+        verify = "开启" if bool(int(row_value(p, "verify_ssl", 0) or 0)) else "关闭"
+        rows.append(
+            f"""
+            <tr>
+              <td>{html.escape(p['name'])}</td>
+              <td>{html.escape(p['base_url'])}</td>
+              <td>{html.escape(p['admin_path'])}</td>
+              <td>{verify}</td>
+              <td>
+                <div class="btn-group">
+                  <form method="post" action="/panels/test?id={p['id']}"><button type="submit" class="button ghost small">测试连接</button></form>
+                  <a class="button ghost small" href="/panels/edit?id={p['id']}">编辑</a>
+                  <form method="post" action="/panels/delete?id={p['id']}"><button class="button danger small" type="submit">删除</button></form>
+                  <a class="button primary small" href="/panels/import?id={p['id']}">导入站点</a>
+                </div>
+              </td>
+            </tr>
+            """
+        )
+    content = f"""
+    <div class="page-toolbar">
+      <div class="toolbar-left">
+        <a class="button primary" href="/panels/new">新增面板</a>
+        <a class="button ghost" href="/">返回</a>
+      </div>
+    </div>
+    <div class="card">
+      <div class="table-responsive">
+        <table class="cert-table">
+          <thead>
+            <tr><th>名称</th><th>地址</th><th>Admin Path</th><th>HTTPS 证书校验</th><th>操作</th></tr>
+          </thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return render_page(content, message)
+
+
+def render_panel_form(panel=None, message=""):
+    panel = panel or {"name": "", "base_url": "", "admin_path": "/bt", "api_token": "", "verify_ssl": 0}
+    checked = "checked" if bool(int(row_value(panel, "verify_ssl", 0) or 0)) else ""
+    content = f"""
+    <form method="post">
+      <div class="form-row"><label>名称</label><input type="text" name="name" value="{html.escape(panel['name'])}" required></div>
+      <div class="form-row"><label>面板地址</label><input type="text" name="base_url" value="{html.escape(panel['base_url'])}" placeholder="http://IP:8888" required></div>
+      <div class="form-row"><label>Admin Path</label><input type="text" name="admin_path" value="{html.escape(panel['admin_path'])}" placeholder="/bt"></div>
+      <div class="form-row"><label>API Token</label><input type="text" name="api_token" value="{html.escape(panel['api_token'])}" required></div>
+      <div class="form-row"><label><input type="checkbox" name="verify_ssl" value="1" {checked}> 验证 HTTPS 证书（自签/缺链请关闭）</label></div>
+      <div class="actions"><button type="submit">保存</button><a class="button ghost" href="/panels">返回</a></div>
+    </form>
+    """
+    return render_page(content, message)
+
+
+def render_import(message="", sites=None, panel=None):
+    rows = []
+    for s in sites or []:
+        rows.append(
+            f"<tr><td>{html.escape(s)}</td><td><form method='post' action='/import/add?panel_id={panel['id']}&site={html.escape(s)}'><button type='submit'>加入证书配置</button></form></td></tr>"
+        )
+    content = f"""
+    <div class="actions"><a class="button ghost" href="/panels">返回</a></div>
+    <h2>导入宝塔站点 - {html.escape(panel['name'])}</h2>
+    <div class="actions"><form method="post" action="/import/scan?panel_id={panel['id']}"><button type="submit">扫描站点</button></form></div>
+    <table><thead><tr><th>站点/域名</th><th>操作</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+    """
+    return render_page(content, message)
+
+
+def render_bt_settings(message=""):
+    stored = get_local_bt_settings()
+    effective = get_local_panel_config() or {}
+    base_url = stored.get("base_url") or effective.get("base_url") or "https://127.0.0.1:22460"
+    admin_path = stored.get("admin_path") or effective.get("admin_path") or "/bt"
+    api_token = stored.get("api_token") or effective.get("api_token") or ""
+    checked = "checked" if bool(int(stored.get("verify_ssl") or 0)) else ""
+    hint = "已自动读取本机宝塔配置，可在此覆盖保存" if (not stored.get("api_token") and effective.get("api_token")) else ""
+    nginx_status = ""
+    try:
+        txt = NGINX_DEFAULT_CONF.read_text("utf-8", errors="ignore") if NGINX_DEFAULT_CONF.exists() else ""
+        nginx_status = "已配置" if nginx_default_has_acme_proxy(txt) else "未配置"
+    except Exception:
+        nginx_status = "未知"
+    content = f"""
+    <form method="post">
+      <h2>本机宝塔面板设置</h2>
+      <div class="form-row"><label>面板地址</label><input type="text" name="base_url" value="{html.escape(base_url)}" placeholder="https://127.0.0.1:22460"></div>
+      <div class="form-row"><label>Admin Path（安全入口）</label><input type="text" name="admin_path" value="{html.escape(admin_path)}" placeholder="/24315b07"></div>
+      <div class="form-row"><label>API Token（接口密钥）</label><input type="text" name="api_token" value="{html.escape(api_token)}" placeholder="宝塔面板-设置-API接口"></div>
+      <div class="form-row"><label><input type="checkbox" name="verify_ssl" value="1" {checked}> 验证 HTTPS 证书（一般本机可关闭）</label></div>
+      {f'<div class="flash">{html.escape(hint)}</div>' if hint else ''}
+      <div class="actions">
+        <button type="submit" class="button primary">保存</button>
+        <a class="button ghost" href="/">返回</a>
+      </div>
+    </form>
+    <div class="card" style="margin-top:12px">
+      <h2>Nginx 默认站点</h2>
+      <div class="flash">用于让任意解析到本机的域名都能通过 HTTP-01 校验。当前状态：{html.escape(nginx_status)}</div>
+      <div class="actions">
+        <form method="post" action="/nginx/default/apply">
+          <button type="submit" class="button primary">一键配置 ACME 转发</button>
+        </form>
+      </div>
+      <div class="text-muted" style="margin-top:8px; font-size:12px">{html.escape(str(NGINX_DEFAULT_CONF))}</div>
+      <div class="text-muted" style="margin-top:6px; font-size:12px">转发目标：http://127.0.0.1:{html.escape(str(ACME_PROXY_PORT))}</div>
+    </div>
+    """
+    return render_page(content, message)
+
+
+def render_logs():
+    with get_db() as conn:
+        items = conn.execute(
+            "SELECT id, action, target, status, message, created_at FROM logs ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+    rows = []
+    for it in items:
+        rows.append(
+            f"<tr><td>{it['id']}</td><td>{html.escape(it['action'])}</td><td>{html.escape(it['target'] or '')}</td><td>{it['status']}</td><td>{html.escape(it['message'] or '')}</td><td>{it['created_at']}</td></tr>"
+        )
+    content = f"""
+    <div class="actions"><a class="button ghost" href="/">返回</a></div>
+    <table><thead><tr><th>ID</th><th>动作</th><th>目标</th><th>状态</th><th>消息</th><th>时间</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+    """
+    return render_page(content)
+
+
+def get_panel_by_id(panel_id):
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM panels WHERE id = ?", (panel_id,)).fetchone()
+
+
+def import_sites_from_local():
+    db_path = "/www/server/panel/data/default.db"
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT name FROM sites").fetchall()
+            conn.close()
+            return sorted({r["name"] for r in rows})
+        except Exception:
+            pass
+    root = "/www/server/panel/vhost/nginx"
+    if not os.path.isdir(root):
+        return []
+    names = []
+    for fn in os.listdir(root):
+        if not fn.endswith(".conf"):
+            continue
+        try:
+            text = Path(os.path.join(root, fn)).read_text("utf-8", errors="ignore")
+            for m in re.finditer(r"server_name\\s+([^;]+);", text):
+                names.extend([x.strip() for x in m.group(1).split() if x.strip()])
+        except Exception:
+            pass
+    return sorted(set(names))
+
+
+def split_domain_field(value):
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[,|\s]+", raw)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def extract_webroot_from_nginx_conf_text(text):
+    if not text:
+        return None
+    m = re.search(r"(?m)^\s*root\s+([^;]+);", text)
+    if not m:
+        return None
+    path = (m.group(1) or "").strip().strip('"').strip("'")
+    return path or None
+
+
+def get_local_bt_site_webroot(site_name_or_domain):
+    target = (site_name_or_domain or "").strip()
+    if not target:
+        return None
+
+    db_path = "/www/server/panel/data/default.db"
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(sites)").fetchall()]
+            path_col = None
+            for c in ["path", "site_path", "sitePath", "root"]:
+                if c in cols:
+                    path_col = c
+                    break
+            if path_col:
+                row = conn.execute(
+                    f"SELECT {path_col} AS p FROM sites WHERE name = ? LIMIT 1", (target,)
+                ).fetchone()
+                if row:
+                    p = (row["p"] or "").strip()
+                    if p:
+                        return p
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    root = "/www/server/panel/vhost/nginx"
+    if not os.path.isdir(root):
+        return None
+
+    direct = os.path.join(root, f"{target}.conf")
+    if os.path.exists(direct):
+        try:
+            text = Path(direct).read_text("utf-8", errors="ignore")
+            p = extract_webroot_from_nginx_conf_text(text)
+            if p:
+                return p
+        except Exception:
+            pass
+
+    for fn in os.listdir(root):
+        if not fn.endswith(".conf"):
+            continue
+        try:
+            text = Path(os.path.join(root, fn)).read_text("utf-8", errors="ignore")
+            matched = False
+            for m in re.finditer(r"server_name\s+([^;]+);", text):
+                names = split_domain_field(m.group(1))
+                for nm in names:
+                    if nm == target:
+                        matched = True
+                        break
+                    if nm.startswith("*.") and target.endswith(nm[1:]):
+                        matched = True
+                        break
+                if matched:
+                    break
+            if not matched:
+                continue
+            p = extract_webroot_from_nginx_conf_text(text)
+            if p:
+                return p
+        except Exception:
+            pass
+    return None
+
+
+def get_panel_site_webroot(panel, domain):
+    if not panel or not domain:
+        return None
+    ok, _status, body, _attempted, _meta = panel_api_request(
+        panel,
+        "/data",
+        {"action": "getData", "table": "sites", "limit": 200, "p": 1},
+    )
+    if not ok:
+        return None
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("status") is False:
+        return None
+    items = []
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        items = payload.get("data") or payload.get("list") or []
+    elif isinstance(payload, list):
+        items = payload
+    elif "list" in data:
+        items = data.get("list") or []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or item.get("domain") or item.get("site_name") or "").strip()
+        if not name:
+            continue
+        matched = False
+        for nm in split_domain_field(name):
+            if nm == domain:
+                matched = True
+                break
+            if nm.startswith("*.") and domain.endswith(nm[1:]):
+                matched = True
+                break
+        if not matched and domain != name:
+            continue
+        p = (item.get("path") or item.get("sitePath") or item.get("site_path") or "").strip()
+        if p:
+            return p
+    return None
+
+
+def guess_webroot_for_domain(domain, site_name=None):
+    d = (domain or "").strip()
+    if not d:
+        return None
+    candidates = [d]
+    parts = d.split(".")
+    if len(parts) > 2:
+        for i in range(1, len(parts) - 1):
+            alt = ".".join(parts[i:])
+            if alt.count(".") >= 1 and alt not in candidates:
+                candidates.append(alt)
+
+    for cand in candidates:
+        if site_name:
+            p = get_local_bt_site_webroot(site_name)
+            if p:
+                return p
+        p = get_local_bt_site_webroot(cand)
+        if p:
+            return p
+        panel = get_local_panel_config()
+        if panel:
+            p = get_panel_site_webroot(panel, cand)
+            if p:
+                return p
+    return None
+
+
+def parse_sites_payload(data):
+    if not isinstance(data, dict):
+        return []
+    if data.get("status") is False:
+        return []
+    items = []
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        items = payload.get("data") or payload.get("list") or []
+    elif isinstance(payload, list):
+        items = payload
+    elif "list" in data:
+        items = data.get("list") or []
+    names = []
+    for item in items:
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("domain") or item.get("site_name")
+            if name:
+                names.append(name)
+    return sorted(set(names))
+
+
+def import_sites_from_panel(panel):
+    ok, status, body, _attempted, _meta = panel_api_request(panel, "/data", {"action": "getData", "table": "sites", "limit": 200, "p": 1})
+    if status == 404:
+        log_action("import_scan", panel["name"], "fail", "HTTP 404")
+        return []
+    try:
+        data = json.loads(body)
+    except Exception:
+        log_action("import_scan", panel["name"], "fail", "bad json")
+        return []
+    names = parse_sites_payload(data)
+    if names:
+        return names
+    ok, status, body, _attempted, _meta = panel_api_request(panel, "/data", {"action": "getData", "table": "domain", "limit": 200, "p": 1})
+    if status == 404:
+        log_action("import_scan", panel["name"], "fail", "HTTP 404")
+        return []
+    try:
+        data = json.loads(body)
+    except Exception:
+        log_action("import_scan", panel["name"], "fail", "bad json")
+        return []
+    return parse_sites_payload(data)
+
+
+def import_sites_from_local_panel_api():
+    panel = get_local_panel_config()
+    if not panel:
+        return []
+    return import_sites_from_panel(panel)
+
+
+def check_api_token(handler):
+    token = None
+    auth = handler.headers.get("X-API-Token", "")
+    if auth:
+        token = auth.strip()
+    if not token:
+        parsed = urlparse(handler.path)
+        params = parse_qs(parsed.query)
+        token = params.get("token", [""])[0]
+    return token == get_setting("api_token")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def respond_html(self, body, status=HTTPStatus.OK, cookies=None):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        if cookies:
+            for ck in cookies:
+                self.send_header("Set-Cookie", ck)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def respond_bytes(self, content, content_type="application/octet-stream", filename=None, status=HTTPStatus.OK):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        if filename:
+            safe = filename.replace('"', "")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
+        self.end_headers()
+        self.wfile.write(content)
+
+    def redirect(self, path, message="", cookies=None):
+        if message:
+            parsed = urlparse(path)
+            query = parse_qs(parsed.query)
+            query["msg"] = [message]
+            path = urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    urlencode(query, doseq=True),
+                    parsed.fragment,
+                )
+            )
+        self.send_response(HTTPStatus.SEE_OTHER)
+        if cookies:
+            for ck in cookies:
+                self.send_header("Set-Cookie", ck)
+        self.send_header("Location", path)
+        self.end_headers()
+
+    def require_auth(self):
+        user = get_current_user(self)
+        if not user:
+            self.redirect("/login")
+            return None
+        return user
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/.well-known/acme-challenge/"):
+            rel = parsed.path.lstrip("/")
+            file_path = ACME_CHALLENGE_ROOT / rel
+            if file_path.exists() and file_path.is_file():
+                try:
+                    content = file_path.read_bytes()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+                except Exception:
+                    pass
+            self.send_response(HTTPStatus.NOT_FOUND)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+            return
+
+        if parsed.path.startswith("/static/"):
+            file_path = BASE_DIR / parsed.path.lstrip("/")
+            if file_path.exists() and file_path.is_file():
+                try:
+                    content = file_path.read_bytes()
+                    self.send_response(HTTPStatus.OK)
+                    if parsed.path.endswith(".css"):
+                        self.send_header("Content-Type", "text/css; charset=utf-8")
+                    elif parsed.path.endswith(".js"):
+                         self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                    else:
+                        self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+                except Exception:
+                    pass
+            return self.respond_html("Not Found", status=HTTPStatus.NOT_FOUND)
+
+        params = parse_qs(parsed.query)
+        message = params.get("msg", [""])[0]
+        if parsed.path == "/login":
+            return self.respond_html(render_login(message))
+        if parsed.path == "/logout":
+            return self.redirect("/login", "已退出", cookies=["session=; Path=/; Max-Age=0"])
+        user = self.require_auth()
+        if not user:
+            return
+        if user["must_change"] and parsed.path != "/password":
+            return self.redirect("/password", "请先修改密码")
+        if parsed.path == "/password":
+            return self.respond_html(render_password(message))
+        if parsed.path == "/":
+            return self.respond_html(render_index(message))
+        if parsed.path == "/apply":
+            return self.redirect("/new")
+        if parsed.path == "/new":
+            return self.respond_html(render_new(message))
+        if parsed.path == "/cert":
+            cert_id = params.get("id", [""])[0]
+            if not cert_id.isdigit():
+                return self.redirect("/", "证书 ID 无效")
+            with get_db() as conn:
+                cert = conn.execute("SELECT * FROM certs WHERE id = ?", (cert_id,)).fetchone()
+            if not cert:
+                return self.redirect("/", "证书配置不存在")
+            return self.respond_html(render_cert_detail(cert, message))
+        if parsed.path == "/download":
+            cert_id = params.get("id", [""])[0]
+            dtype = (params.get("type", [""])[0] or "").strip()
+            if not cert_id.isdigit():
+                return self.redirect("/", "证书 ID 无效")
+            if dtype not in {"cert", "key", "zip"}:
+                return self.redirect(f"/cert?id={cert_id}", "下载类型无效")
+            with get_db() as conn:
+                cert = conn.execute("SELECT * FROM certs WHERE id = ?", (cert_id,)).fetchone()
+            if not cert:
+                return self.redirect("/", "证书配置不存在")
+            cert_path = (cert["cert_path"] or "").strip()
+            key_path = (cert["key_path"] or "").strip()
+            domain = primary_domain(cert["domains"] or f"cert-{cert_id}")
+            if dtype == "cert":
+                if not cert_path or not Path(cert_path).exists():
+                    return self.redirect(f"/cert?id={cert_id}", "证书文件不存在")
+                return self.respond_bytes(Path(cert_path).read_bytes(), "application/x-pem-file", f"{domain}.fullchain.pem")
+            if dtype == "key":
+                if not key_path or not Path(key_path).exists():
+                    return self.redirect(f"/cert?id={cert_id}", "私钥文件不存在")
+                return self.respond_bytes(Path(key_path).read_bytes(), "application/x-pem-file", f"{domain}.key")
+            if not cert_path or not Path(cert_path).exists() or not key_path or not Path(key_path).exists():
+                return self.redirect(f"/cert?id={cert_id}", "证书或私钥文件不存在")
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(f"{domain}.fullchain.pem", Path(cert_path).read_bytes())
+                zf.writestr(f"{domain}.key", Path(key_path).read_bytes())
+            return self.respond_bytes(buf.getvalue(), "application/zip", f"{domain}.zip")
+        if parsed.path.startswith("/panels"):
+            return self.redirect("/", "单机部署模式不支持添加/管理其他服务器宝塔面板")
+        if parsed.path == "/import/local":
+            sites = import_sites_from_local()
+            if not sites:
+                sites = import_sites_from_local_panel_api()
+            rows = []
+            for s in sites:
+                rows.append(
+                    f"<tr><td>{html.escape(s)}</td><td><form method='post' action='/import/local/add?site={html.escape(s)}'><button type='submit'>加入证书配置</button></form></td></tr>"
+                )
+            empty_tip = ""
+            if not sites:
+                empty_tip = "未获取到本机站点/域名。请检查：1）已在“本机宝塔设置”保存正确的面板地址/Admin Path/API Token；2）宝塔面板已开启 API 接口；3）容器运行在宝塔服务器本机。"
+            content = f"""
+            <div class="actions"><a class="button ghost" href="/">返回</a></div>
+            {f'<div class="flash">{html.escape(empty_tip)}</div>' if empty_tip else ''}
+            <table><thead><tr><th>站点/域名</th><th>操作</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+            """
+            return self.respond_html(render_page(content, message))
+        if parsed.path == "/bt":
+            return self.respond_html(render_bt_settings(message))
+        if parsed.path == "/logs":
+            return self.respond_html(render_logs())
+        return self.respond_html("Not Found", status=HTTPStatus.NOT_FOUND)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        if parsed.path == "/login":
+            form = parse_form(self)
+            username = (form.get("username", [""])[0]).strip()
+            password = (form.get("password", [""])[0]).strip()
+            with get_db() as conn:
+                user = conn.execute("SELECT id, username, password_hash, must_change FROM users WHERE username = ?", (username,)).fetchone()
+            if not user or not verify_password(password, user["password_hash"]):
+                log_action("login", username, "fail", "bad credentials")
+                return self.respond_html(render_login("账号或密码错误"))
+            token = sign_session(user["id"], user["must_change"])
+            log_action("login", username, "ok", "")
+            return self.redirect("/", cookies=[f"session={token}; Path=/; HttpOnly"])
+        user = self.require_auth()
+        if not user:
+            return
+        if user["must_change"] and parsed.path != "/password":
+            return self.redirect("/password", "请先修改密码")
+        if parsed.path == "/password":
+            form = parse_form(self)
+            old_password = (form.get("old_password", [""])[0]).strip()
+            new_password = (form.get("new_password", [""])[0]).strip()
+            confirm_password = (form.get("confirm_password", [""])[0]).strip()
+            if not new_password or new_password != confirm_password:
+                return self.respond_html(render_password("新密码不一致"))
+            with get_db() as conn:
+                row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (user["id"],)).fetchone()
+                if not row or not verify_password(old_password, row["password_hash"]):
+                    return self.respond_html(render_password("旧密码错误"))
+                conn.execute(
+                    "UPDATE users SET password_hash = ?, must_change = 0, updated_at = ? WHERE id = ?",
+                    (create_password_hash(new_password), datetime.utcnow().isoformat(), user["id"]),
+                )
+            token = sign_session(user["id"], 0)
+            log_action("password_change", user["username"], "ok", "")
+            return self.redirect("/", "密码已更新", cookies=[f"session={token}; Path=/; HttpOnly"])
+        if parsed.path == "/bt":
+            form = parse_form(self)
+            base_url = (form.get("base_url", [""])[0]).strip()
+            admin_path = (form.get("admin_path", [""])[0]).strip()
+            api_token = (form.get("api_token", [""])[0]).strip()
+            verify_ssl = 1 if (form.get("verify_ssl", [""])[0]).strip() else 0
+            if api_token and not base_url:
+                base_url = "https://127.0.0.1:22460"
+            if admin_path and not admin_path.startswith("/"):
+                admin_path = "/" + admin_path
+            save_local_bt_settings(base_url, admin_path, api_token, verify_ssl)
+            panel = get_local_panel_config()
+            if not panel:
+                log_action("bt_settings", base_url or "auto", "ok", "saved only")
+                return self.redirect("/bt", "已保存，但未检测到可用的宝塔配置")
+            ok, msg = test_panel(panel)
+            log_action("bt_settings", base_url or "auto", "ok" if ok else "fail", msg)
+            return self.redirect("/bt", f"已保存，{msg}" if ok else f"已保存，但连接失败：{msg}")
+        if parsed.path == "/nginx/default/apply":
+            ok, msg = apply_nginx_default_acme_proxy()
+            log_action("nginx_default", "apply", "ok" if ok else "fail", msg)
+            return self.redirect("/bt", msg if ok else f"配置失败：{msg}")
+        if parsed.path == "/new":
+            form = parse_form(self)
+            domains = (form.get("domains", [""])[0]).strip()
+            valid, result = validate_domains(domains)
+            if not valid:
+                return self.respond_html(render_new(result))
+            if any(d.startswith("*.") for d in result):
+                return self.respond_html(render_new("当前模式不支持通配符域名（*.example.com），请使用 DNS 验证"))
+            normalized_domains = ", ".join(result)
+            existing_id = get_existing_cert_id_for_domains(normalized_domains)
+            if existing_id:
+                return self.redirect(f"/cert?id={existing_id}", "域名已存在证书记录")
+
+            name = primary_domain(normalized_domains)
+            (ACME_CHALLENGE_ROOT / ".well-known" / "acme-challenge").mkdir(parents=True, exist_ok=True)
+            webroot = str(ACME_CHALLENGE_ROOT)
+            email = f"admin@{primary_domain(normalized_domains)}"
+            now = datetime.utcnow().isoformat()
+            with get_db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO certs (name, domains, webroot, email, panel_id, site_name, acme_home, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (name, normalized_domains, webroot, email, None, None, str(DEFAULT_ACME_HOME), now, now),
+                )
+                cert_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                cert = conn.execute("SELECT * FROM certs WHERE id = ?", (cert_id,)).fetchone()
+            log_action("cert_add", domains, "ok", name)
+            try:
+                ok, issued = issue_cert(cert)
+            except Exception as e:
+                record_error(cert_id, str(e))
+                return self.redirect(f"/cert?id={cert_id}", f"申请失败: {e}")
+            if not ok:
+                record_error(cert_id, issued)
+                return self.redirect(f"/cert?id={cert_id}", f"申请失败: {issued}")
+            cert_path, key_path = issued
+            record_issue(cert_id, cert_path, key_path)
+            return self.redirect(f"/cert?id={cert_id}", "申请成功")
+        if parsed.path == "/issue" or parsed.path == "/renew":
+            cert_id = params.get("id", [""])[0]
+            if not cert_id.isdigit():
+                return self.redirect("/", "证书 ID 无效")
+            with get_db() as conn:
+                cert = conn.execute("SELECT * FROM certs WHERE id = ?", (cert_id,)).fetchone()
+            if not cert:
+                return self.redirect("/", "证书配置不存在")
+            if parsed.path == "/issue":
+                existing_expiry = parse_expiry(cert["cert_path"])
+                if existing_expiry and existing_expiry > datetime.utcnow():
+                    return self.redirect("/", "证书已存在，请使用续签")
+                try:
+                    ok, result = issue_cert(cert)
+                except Exception as e:
+                    log_action("issue", cert.get("domains") if isinstance(cert, dict) else str(cert_id), "fail", str(e))
+                    record_error(cert_id, str(e))
+                    return self.redirect("/", f"申请失败: {e}")
+                if not ok:
+                    record_error(cert_id, result)
+                    return self.redirect("/", result)
+                cert_path, key_path = result
+                record_issue(cert_id, cert_path, key_path)
+            else:
+                try:
+                    ok, result = renew_cert(cert)
+                except Exception as e:
+                    log_action("renew", cert.get("domains") if isinstance(cert, dict) else str(cert_id), "fail", str(e))
+                    record_error(cert_id, str(e))
+                    return self.redirect("/", f"续签失败: {e}")
+                if not ok:
+                    record_error(cert_id, result)
+                    return self.redirect("/", result)
+                cert_path, key_path = result
+                record_renew(cert_id, cert_path, key_path)
+            deploy_local(cert["site_name"], cert_path, key_path)
+            return self.redirect("/", "已完成")
+        if parsed.path == "/delete":
+            cert_id = params.get("id", [""])[0]
+            if not cert_id.isdigit():
+                return self.redirect("/", "证书 ID 无效")
+            with get_db() as conn:
+                conn.execute("DELETE FROM certs WHERE id = ?", (cert_id,))
+            log_action("cert_delete", cert_id, "ok", "")
+            return self.redirect("/", "已删除")
+        if parsed.path.startswith("/panels") or parsed.path == "/import/scan":
+            return self.redirect("/", "单机部署模式不支持添加/管理其他服务器宝塔面板")
+        if parsed.path == "/import/add":
+            return self.redirect("/", "单机部署模式不支持远程面板导入")
+        if parsed.path == "/import/local/add":
+            site = params.get("site", [""])[0]
+            if not site:
+                return self.redirect("/import/local", "参数错误")
+            name = site
+            domains = site
+            if has_cert_config_for_domains(domains):
+                return self.redirect("/", "域名已存在证书配置，禁止重复添加")
+            webroot = guess_webroot_for_domain(primary_domain(site), site)
+            if (not webroot) or (not Path(webroot).exists()):
+                (ACME_CHALLENGE_ROOT / ".well-known" / "acme-challenge").mkdir(parents=True, exist_ok=True)
+                webroot = str(ACME_CHALLENGE_ROOT)
+            email = f"admin@{primary_domain(site)}" if "." in site else "admin@example.com"
+            now = datetime.utcnow().isoformat()
+            with get_db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO certs (name, domains, webroot, email, panel_id, site_name, acme_home, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (name, domains, webroot, email, None, site, str(DEFAULT_ACME_HOME), now, now),
+                )
+            log_action("import_local_add", site, "ok", "")
+            return self.redirect("/", "已加入配置")
+        return self.respond_html("Not Found", status=HTTPStatus.NOT_FOUND)
+
+
+def start_server():
+    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    init_db()
+    if os.environ.get("AUTO_RENEW", "1") == "1":
+        threading.Thread(target=auto_loop, daemon=True).start()
+    start_server()
