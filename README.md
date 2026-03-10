@@ -29,6 +29,15 @@ Let’s Encrypt 的 HTTP-01 校验会访问：
 
 本项目默认使用 `DATA_DIR/acme-webroot` 作为 ACME Webroot，并在签发前做“可达性自检”（写入随机文件后立刻用 HTTP 访问验证），避免盲目等待 CA 失败。
 
+## 为什么有时需要重载 Nginx？
+
+只有在你“修改了 Nginx 配置文件”时，新的转发规则才会生效；Nginx 必须 reload 才会加载新配置。  
+一旦 `/.well-known/acme-challenge/` 的转发规则配置完成并生效，后续续签/签发 **不需要每次都 reload**。
+
+本项目会在检测到 HTTP-01 返回 404 时，尝试自动修复并触发重载：
+- 优先通过宝塔面板 API 触发 Nginx reload（推荐做法）
+- 若宝塔版本/接口不支持，则会提示你在宿主机手动执行一次 reload（通常只需要一次）
+
 ## 快速部署（Docker，推荐）
 
 ### 1) 拉取镜像
@@ -75,6 +84,8 @@ docker run -d \
 并尝试通过宝塔 API 触发 Nginx 重载（若失败会提示你手动重载）。
 
 > 注意：容器需要把 `/www/server/panel/vhost/nginx` 以 `rw` 方式挂载进去，否则会提示没有写入权限。
+> 
+> 若提示宝塔不支持重载接口，请在宿主机执行一次：`nginx -t && nginx -s reload`。
 
 ## 手动配置 Nginx 默认站点（不依赖按钮）
 
@@ -122,6 +133,11 @@ nginx -t && nginx -s reload
 - 每 24 小时扫描一次
 - 对剩余天数 ≤ 30 的证书执行 `acme.sh --renew`
 
+## 手动“续签”的含义
+
+面板里的“续签”按钮会强制重新签发（等同强制续签），用于把剩余天数重新拉回到接近 90 天。  
+注意：Let’s Encrypt 有频率限制，请避免短时间内反复点击同一域名的续签。
+
 ## 环境变量
 
 - `PORT`：面板监听端口（默认 8080）
@@ -163,4 +179,3 @@ python3 app.py
 ## License
 
 未指定（如需开源协议，可添加 LICENSE）。
-
