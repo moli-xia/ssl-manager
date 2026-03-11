@@ -105,19 +105,18 @@ def build_nginx_default_conf_for_acme(proxy_port):
 
 
 def nginx_default_has_acme_proxy(text):
-    if not text:
-        return False
-    if "/.well-known/acme-challenge/" not in text:
-        return False
-    if "proxy_pass" not in text:
-        return False
-    return True
+    return nginx_conf_has_acme_proxy(text)
 
 
 def bt_try_reload_nginx(panel):
     if not panel:
         return False, "未配置宝塔面板 API"
     actions = [
+        ("/ajax", "ReloadNginx"),
+        ("/ajax", "NginxReload"),
+        ("/ajax", "RestartNginx"),
+        ("/ajax", "ReloadWeb"),
+        ("/ajax", "RestartWeb"),
         ("/system", "RestartWeb"),
         ("/system", "ReloadWeb"),
         ("/system", "RestartNginx"),
@@ -192,11 +191,9 @@ def nginx_conf_has_acme_proxy(text):
             ln = ln.split("#", 1)[0]
         cleaned_lines.append(ln)
     cleaned = "\n".join(cleaned_lines)
-    if "/.well-known/acme-challenge/" not in cleaned:
+    if not re.search(r"location\s+\^~\s+/.well-known/acme-challenge/", cleaned):
         return False
     if "proxy_pass" not in cleaned:
-        return False
-    if "location" not in cleaned:
         return False
     return True
 
@@ -240,6 +237,7 @@ def patch_nginx_conf_for_domain(text, domain):
     n = len(src)
     patched = 0
     any_server = False
+    matched_blocks = 0
     while i < n:
         m = re.search(r"(?m)^\s*server\s*(\{|\r?$)", src[i:])
         if not m:
@@ -283,6 +281,7 @@ def patch_nginx_conf_for_domain(text, domain):
             res.append(server_block)
             i = j
             continue
+        matched_blocks += 1
         if nginx_conf_has_acme_proxy(server_clean):
             res.append(server_block)
             i = j
@@ -305,6 +304,8 @@ def patch_nginx_conf_for_domain(text, domain):
         i = j
     if patched:
         return "".join(res), patched, "patched"
+    if matched_blocks:
+        return src, 0, "exists"
     if any_server:
         return src, 0, "no matched server block"
     return src, 0, "no server block"
@@ -400,6 +401,12 @@ def ensure_domain_acme_proxy(domain):
                 last_reason = f"no permission: {conf.name}"
                 continue
             new, patched_blocks, reason = patch_nginx_conf_for_domain(txt, d)
+            if reason in {"no matched server block", "no server block"}:
+                continue
+            touched += 1
+            if reason == "exists":
+                last_reason = f"{conf.name}: exists"
+                continue
             if (not new) or patched_blocks == 0:
                 last_reason = f"{conf.name}: {reason}"
                 continue
@@ -418,7 +425,7 @@ def ensure_domain_acme_proxy(domain):
         return True, f"patched={patched}/{touched} reload={'ok' if ok_reload else 'fail'}"
     if touched:
         extra = f" last={last_reason}" if last_reason else ""
-        return False, f"matched={touched} patched=0 errors={errors}{extra}"
+        return True, f"matched={touched} patched=0 errors={errors}{extra}"
     return False, "no matching conf"
 
 

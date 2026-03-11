@@ -38,6 +38,9 @@ Let’s Encrypt 的 HTTP-01 校验会访问：
 - 优先通过宝塔面板 API 触发 Nginx reload（推荐做法）
 - 若宝塔版本/接口不支持，则会提示你在宿主机手动执行一次 reload（通常只需要一次）
 
+> 说明：容器内的 `nginx`/`systemctl` 命令通常不存在，即使你在宿主机已安装并运行 Nginx。  
+> 因此“容器内自动执行 `nginx -s reload`”在默认 Docker 部署方式下不可行，本项目主要依赖宝塔 API 来触发宿主机 Nginx 重载。
+
 ## 快速部署（Docker，推荐）
 
 ### 1) 拉取镜像
