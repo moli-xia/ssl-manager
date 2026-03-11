@@ -40,6 +40,22 @@ Let’s Encrypt 的 HTTP-01 校验会访问：
 
 > 说明：容器内的 `nginx`/`systemctl` 命令通常不存在，即使你在宿主机已安装并运行 Nginx。  
 > 因此“容器内自动执行 `nginx -s reload`”在默认 Docker 部署方式下不可行，本项目主要依赖宝塔 API 来触发宿主机 Nginx 重载。
+>
+> 当页面提示类似“宝塔未提供可用的重载接口（请手动重载 Nginx）”时，请你在**宝塔所在宿主机**手动重载一次（任选其一）：
+>
+> ```bash
+> nginx -t && nginx -s reload
+> ```
+>
+> ```bash
+> systemctl reload nginx
+> ```
+>
+> ```bash
+> /www/server/nginx/sbin/nginx -t && /www/server/nginx/sbin/nginx -s reload
+> ```
+>
+> 手动重载成功后，再回到面板点击“申请/续签”即可通过 HTTP-01 校验。
 
 ## 快速部署（Docker，推荐）
 
