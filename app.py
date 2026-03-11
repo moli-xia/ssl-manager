@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
+import urllib.request
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
@@ -351,6 +352,19 @@ def ensure_site_acme_proxy(site_name):
     if not os.access(str(conf), os.R_OK | os.W_OK):
         return False, f"no permission: {conf}"
     old = conf.read_text("utf-8", errors="ignore")
+    if "." in name:
+        new, patched_blocks, reason = patch_nginx_conf_for_domain(old, name)
+        if reason == "exists":
+            ok_reload, msg_reload = reload_nginx_best_effort()
+            return True, "exists_reloaded" if ok_reload else "exists"
+        if reason == "patched" and patched_blocks > 0 and new:
+            backup_dir = DATA_DIR / "nginx-site-backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            (backup_dir / f"{name}.conf.{stamp}.bak").write_text(old, encoding="utf-8")
+            conf.write_text(new, encoding="utf-8")
+            ok_reload, msg_reload = reload_nginx_best_effort()
+            return True, "reloaded" if ok_reload else "written"
     new, reason = inject_acme_location_into_nginx_conf(old)
     if not new:
         ok_reload, msg_reload = reload_nginx_best_effort()
@@ -395,7 +409,6 @@ def ensure_domain_acme_proxy(domain):
                     break
             if not matched:
                 continue
-            touched += 1
             if not os.access(str(conf), os.R_OK | os.W_OK):
                 errors += 1
                 last_reason = f"no permission: {conf.name}"
@@ -906,6 +919,9 @@ def probe_http01_webroot(domain, webroot):
     token = secrets.token_urlsafe(18)
     challenge_dir = Path(w) / ".well-known" / "acme-challenge"
     file_path = challenge_dir / token
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
     try:
         challenge_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -925,16 +941,62 @@ def probe_http01_webroot(domain, webroot):
             os.chmod(str(file_path), 0o644)
         except Exception:
             pass
-
         url = f"http://{d}/.well-known/acme-challenge/{token}"
-        req = Request(url, method="GET")
-        with urlopen(req, timeout=12) as resp:
-            body = resp.read(2048).decode("utf-8", errors="ignore").strip()
-            if resp.status == 200 and token in body:
-                return True, ""
-            return False, f"HTTP {resp.status}"
-    except Exception as e:
-        return False, str(e)
+        first_status = ""
+        first_loc = ""
+        first_server = ""
+        try:
+            opener = urllib.request.build_opener(_NoRedirect())
+            resp = opener.open(Request(url, method="GET"), timeout=12)
+            first_status = str(getattr(resp, "status", "") or "")
+            first_loc = resp.headers.get("Location") or ""
+            first_server = resp.headers.get("Server") or ""
+            resp.read(1)
+        except HTTPError as e:
+            first_status = str(e.code)
+            first_loc = e.headers.get("Location") or ""
+            first_server = e.headers.get("Server") or ""
+        except Exception:
+            pass
+
+        try:
+            with urlopen(Request(url, method="GET"), timeout=12) as resp2:
+                body2 = resp2.read(2048).decode("utf-8", errors="ignore").strip()
+                if getattr(resp2, "status", 0) == 200 and token in body2:
+                    return True, ""
+                status2 = str(getattr(resp2, "status", "") or "")
+                extra = []
+                if first_status:
+                    extra.append(f"first={first_status}")
+                if first_loc:
+                    extra.append(f"location={first_loc}")
+                if first_server:
+                    extra.append(f"server={first_server}")
+                return False, ("HTTP " + status2 + (f" ({', '.join(extra)})" if extra else ""))
+        except HTTPError as e:
+            body = ""
+            try:
+                body = (e.read(256) or b"").decode("utf-8", errors="ignore").strip()
+            except Exception:
+                body = ""
+            loc = e.headers.get("Location") or ""
+            server = e.headers.get("Server") or ""
+            extra = []
+            if first_status:
+                extra.append(f"first={first_status}")
+            if loc:
+                extra.append(f"location={loc}")
+            elif first_loc:
+                extra.append(f"location={first_loc}")
+            if server:
+                extra.append(f"server={server}")
+            elif first_server:
+                extra.append(f"server={first_server}")
+            if body:
+                extra.append(f"body={body[:120]}")
+            return False, f"HTTP Error {e.code}: {e.reason}" + (f" ({', '.join(extra)})" if extra else "")
+        except Exception as e:
+            return False, str(e)
     finally:
         try:
             file_path.unlink(missing_ok=True)
@@ -1085,7 +1147,7 @@ def issue_cert(cert, force=False, auto_fix=True):
                     continue
                 msg_probe = msg_probe2 or msg_probe
             detail = f"域名 {d} 无法通过 HTTP 访问到当前 Webroot 的挑战文件：{msg_probe}"
-            hint = f"当前 Webroot: {webroot}。请确保 Nginx 已将 /.well-known/acme-challenge/ 转发到本面板（例如 proxy_pass http://127.0.0.1:8088）。"
+            hint = f"当前 Webroot: {webroot}。请确保 Nginx 已将 /.well-known/acme-challenge/ 转发到本面板（例如 proxy_pass http://127.0.0.1:{ACME_PROXY_PORT}）。"
             if fix_msg:
                 hint = hint + f"（已尝试自动修复：{fix_msg}）"
             log_action("issue", cert["domains"], "fail", f"{detail}; {hint}")
